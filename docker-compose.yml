@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  # Backend FastAPI service
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/home/app/backend
+      - chroma-data:/home/app/chroma_db
+    environment:
+      - ENVIRONMENT=development
+      - CHROMA_DB_PATH=/home/app/chroma_db
+      - OLLAMA_HOST=http://ollama:11434
+    depends_on:
+      - chromadb
+      - ollama
+    networks:
+      - rag-network
+
+  # Frontend React service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+    networks:
+      - rag-network
+    depends_on:
+      - backend
+
+  # ChromaDB vector database
+  chromadb:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma-data:/chroma/chroma/
+    environment:
+      - IS_PERSISTENT=true
+      - CHROMA_DB_PATH=/chroma/chroma/
+    networks:
+      - rag-network
+
+  # Ollama for local LLM inference
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - rag-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  chroma-data:
+    driver: local
+  ollama-data:
+    driver: local
+
+networks:
+  rag-network:
+    driver: bridge
