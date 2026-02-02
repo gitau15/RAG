@@ -1,0 +1,1 @@
+"""Monitoring system for the RAG Platform"""
