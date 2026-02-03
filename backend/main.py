@@ -6,6 +6,7 @@ from app.core.config import settings
 from app.monitoring.collector import metrics_collector, health_checker
 from app.monitoring.alerts import alert_manager
 from app.logging.logger import app_logger
+from app.performance.middleware import performance_middleware
 import asyncio
 import time
 
@@ -16,6 +17,9 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc"
 )
+
+# Performance middleware (should be first to measure all processing time)
+app.middleware("http")(performance_middleware.__call__)
 
 # CORS middleware configuration
 app.add_middleware(

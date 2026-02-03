@@ -5,11 +5,15 @@ from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_core.output_parsers import StrOutputParser
+import asyncio
 
 from app.vectorstore.chroma_client import chroma_client
 from app.llm.ollama_client import ollama_client
 from app.llm.system_prompts import SystemPrompts
 from app.models.schemas import QueryRequest, QueryResponse
+from app.performance.optimizer import query_optimizer, PerformanceOptimizer
+from app.logging.logger import perf_logger
+from app.monitoring.collector import metrics_collector
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +38,23 @@ class RAGOrchestrator:
         start_time = time.time()
         
         try:
-            # Step 1: Route based on mode and retrieve relevant documents
-            retrieved_docs = await self._retrieve_documents(query_request)
+            # Optimize query parameters for performance
+            optimized_k = min(query_request.k, 6)  # Cap at 6 for faster response
+            
+            # Create a modified query request with optimized parameters
+            optimized_request = QueryRequest(
+                query=query_request.query,
+                collection_name=query_request.collection_name,
+                mode=query_request.mode,
+                k=optimized_k,
+                tenant_id=query_request.tenant_id,
+                metadata_filter=query_request.metadata_filter
+            )
+            
+            # Step 1: Route based on mode and retrieve relevant documents with timeout
+            retrieval_start = time.time()
+            retrieved_docs = await self._retrieve_documents_with_timeout(optimized_request, timeout=5.0)
+            retrieval_time = time.time() - retrieval_start
             
             # Step 2: Format context from retrieved documents
             context = self._format_context(retrieved_docs)
@@ -50,8 +69,10 @@ class RAGOrchestrator:
                 query_request.query
             )
             
-            # Step 5: Generate response using LLM
-            response = await self._generate_response(augmented_prompt, system_prompt)
+            # Step 5: Generate response using LLM with timeout
+            generation_start = time.time()
+            response = await self._generate_response_with_timeout(augmented_prompt, system_prompt, timeout=6.0)
+            generation_time = time.time() - generation_start
             
             # Step 6: Format results with citations
             formatted_results = self._format_results_with_citations(
@@ -62,6 +83,17 @@ class RAGOrchestrator:
             
             execution_time = time.time() - start_time
             
+            # Log performance metrics
+            perf_logger.log_query_performance(
+                query_id=f"{hash(query_request.query) % 10000}",
+                query_time=execution_time,
+                result_count=len(retrieved_docs),
+                cache_hit=False
+            )
+            
+            # Record metrics
+            metrics_collector.record_request(execution_time, True)
+            
             return QueryResponse(
                 query=query_request.query,
                 results=formatted_results,
@@ -70,9 +102,58 @@ class RAGOrchestrator:
                 execution_time=execution_time
             )
             
+        except asyncio.TimeoutError:
+            execution_time = time.time() - start_time
+            logger.warning(f"Query processing timed out after {execution_time:.2f}s")
+            metrics_collector.record_request(execution_time, False)
+            
+            # Return partial response if we have retrieved docs
+            if 'retrieved_docs' in locals():
+                formatted_results = self._format_results_with_citations(
+                    retrieved_docs, 
+                    "Processing timed out. Please try again with a shorter query.",
+                    query_request
+                )
+                
+                return QueryResponse(
+                    query=query_request.query,
+                    results=formatted_results,
+                    collection_name=query_request.collection_name,
+                    mode=query_request.mode,
+                    execution_time=execution_time
+                )
+            else:
+                raise
         except Exception as e:
+            execution_time = time.time() - start_time
             logger.error(f"RAG orchestration failed: {str(e)}")
+            metrics_collector.record_request(execution_time, False)
             raise
+    
+    async def _retrieve_documents_with_timeout(self, query_request: QueryRequest, timeout: float = 5.0) -> List[Dict[str, Any]]:
+        """Retrieve documents with timeout enforcement"""
+        try:
+            result = await asyncio.wait_for(
+                self._retrieve_documents(query_request),
+                timeout=timeout
+            )
+            return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Document retrieval timed out after {timeout}s")
+            # Return minimal results to avoid complete failure
+            return []
+    
+    async def _generate_response_with_timeout(self, prompt: str, system_prompt: str, timeout: float = 6.0) -> str:
+        """Generate response with timeout enforcement"""
+        try:
+            result = await asyncio.wait_for(
+                self._generate_response(prompt, system_prompt),
+                timeout=timeout
+            )
+            return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Response generation timed out after {timeout}s")
+            return "Response generation timed out. The query was too complex or the system is under heavy load. Please try rephrasing your query."
     
     async def process_query_stream(self, query_request: QueryRequest) -> AsyncGenerator[str, None]:
         """

@@ -11,6 +11,9 @@ from app.ingestion.document_parser import DocumentParser
 from app.vectorstore.chroma_client import chroma_client
 from app.vectorstore.embedding_manager import embedding_manager
 from app.models.schemas import DocumentUploadResponse, DocumentMetadata
+from app.performance.optimizer import document_processor_optimizer
+from app.logging.logger import perf_logger
+from app.monitoring.collector import metrics_collector
 
 logger = logging.getLogger(__name__)
 
@@ -49,21 +52,29 @@ class IngestionPipeline:
         tags = tags or []
         
         try:
+            # Optimize based on file size
+            file_size = len(file_content)
+            chunk_size = document_processor_optimizer.optimize_chunk_size(file_size)
+            
             # Step 1: Save temporary file
             temp_file_path = await self._save_temporary_file(file_content, filename)
             logger.info(f"Saved temporary file: {temp_file_path}")
             
-            # Step 2: Parse document
+            # Step 2: Parse document with optimized parameters
             chunks = self.parser.parse_document(temp_file_path, method="auto")
             logger.info(f"Parsed document into {len(chunks)} chunks")
             
             # Step 3: Create/get collection
             collection = await self._ensure_collection(collection_name, tenant_id, mode)
             
-            # Step 4: Generate embeddings
+            # Step 4: Generate embeddings with optimized batch size
             texts = [chunk["content"] for chunk in chunks]
-            embeddings = self.embedder.embed_documents(texts)
-            logger.info(f"Generated embeddings for {len(embeddings)} chunks")
+            
+            # Generate embeddings with timeout
+            embed_start = time.time()
+            embeddings = await self._generate_embeddings_with_timeout(texts, timeout=30.0)
+            embed_time = time.time() - embed_start
+            logger.info(f"Generated embeddings for {len(embeddings)} chunks in {embed_time:.2f}s")
             
             # Step 5: Prepare metadata
             doc_metadata = self.parser.get_document_metadata(temp_file_path)
@@ -86,14 +97,24 @@ class IngestionPipeline:
                 }
                 chunk_metadatas.append(chunk_metadata)
             
-            # Step 6: Store in vector database
+            # Step 6: Store in vector database with timeout
             ids = [f"{filename}_{chunk['id']}" for chunk in chunks]
-            await self._store_chunks(collection, ids, texts, embeddings, chunk_metadatas)
+            await self._store_chunks_with_timeout(collection, ids, texts, embeddings, chunk_metadatas, timeout=10.0)
             
             # Step 7: Cleanup temporary file
             await self._cleanup_temporary_file(temp_file_path)
             
             processing_time = time.time() - start_time
+            
+            # Log performance metrics
+            perf_logger.log_document_processing(
+                document_id=f"doc_{int(time.time())}",
+                processing_time=processing_time,
+                success=True
+            )
+            
+            # Record metrics
+            metrics_collector.record_document_processing(processing_time, True)
             
             return DocumentUploadResponse(
                 document_id=f"doc_{int(time.time())}",
@@ -103,11 +124,52 @@ class IngestionPipeline:
                 upload_time=processing_time
             )
             
+        except asyncio.TimeoutError:
+            processing_time = time.time() - start_time
+            logger.warning(f"Document ingestion timed out after {processing_time:.2f}s")
+            metrics_collector.record_document_processing(processing_time, False)
+            
+            # Cleanup on timeout
+            if 'temp_file_path' in locals():
+                await self._cleanup_temporary_file(temp_file_path)
+            
+            raise
         except Exception as e:
+            processing_time = time.time() - start_time
             logger.error(f"Ingestion pipeline failed: {str(e)}")
+            metrics_collector.record_document_processing(processing_time, False)
+            
             # Cleanup on failure
             if 'temp_file_path' in locals():
                 await self._cleanup_temporary_file(temp_file_path)
+            raise
+    
+    async def _generate_embeddings_with_timeout(self, texts: List[str], timeout: float = 30.0):
+        """Generate embeddings with timeout enforcement"""
+        try:
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, lambda: self.embedder.embed_documents(texts)),
+                timeout=timeout
+            )
+            return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Embedding generation timed out after {timeout}s")
+            raise
+    
+    async def _store_chunks_with_timeout(self, collection, ids: List[str], texts: List[str], 
+                                   embeddings: List[List[float]], metadatas: List[Dict], timeout: float = 10.0):
+        """Store chunks with timeout enforcement"""
+        try:
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, 
+                    lambda: collection.add(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
+                ),
+                timeout=timeout
+            )
+            logger.info(f"Stored {len(ids)} chunks in collection")
+        except asyncio.TimeoutError:
+            logger.warning(f"Storing chunks timed out after {timeout}s")
             raise
     
     async def batch_ingest_documents(
